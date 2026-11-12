@@ -47,6 +47,27 @@ Telefonā (tajā pašā Wi-Fi):  http://192.168.1.23:8765/?k=…
 *Add to Home screen* so it opens like an app. Windows may ask to allow Python through the firewall: allow it
 for private networks. The `?k=…` part is the access key; keep it in the link.
 
+## Run everything on an Android phone (no computer)
+
+1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its GitHub releases
+   (not Google Play: that build is outdated).
+2. In Termux:
+   ```
+   pkg update && pkg install python git
+   git clone https://github.com/edijsolsteins-create/lsm-zinu-lasitajs
+   chmod +x lsm-zinu-lasitajs/start-android.sh
+   lsm-zinu-lasitajs/start-android.sh
+   ```
+   Chrome opens the app at `http://127.0.0.1:8765/?k=…`. In Chrome: ⋮ → *Add to Home screen*.
+3. Optional keys: `cd lsm-zinu-lasitajs && cp .env.example .env && nano .env` (`pkg install nano` first).
+4. Each later time: open Termux and run `lsm-zinu-lasitajs/start-android.sh`, then tap the home-screen icon.
+   For a one-tap start, install **Termux:Widget** (from the same place as Termux) and copy the script to
+   `~/.shortcuts/` as described inside it.
+
+Termux has to keep running in the background: allow its notification, and in Android settings set Termux's
+battery use to *Unrestricted*. On the phone itself the address is `127.0.0.1`, which browsers treat as secure,
+so screen wake-lock and installing as an app work without HTTPS.
+
 ## Voices on phones
 
 * **Android** has a Latvian voice in *Speech Recognition & Synthesis by Google*. If the app says there is no

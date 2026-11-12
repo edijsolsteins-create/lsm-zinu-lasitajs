@@ -946,6 +946,9 @@ def lan_ip():
 def open_browser(url):
     system = platform.system()
     try:
+        if shutil.which("termux-open-url"):          # Android phone running Termux
+            subprocess.Popen(["termux-open-url", url])
+            return
         if system == "Windows":
             os.startfile("microsoft-edge:" + url)
             return
