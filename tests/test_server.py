@@ -82,13 +82,15 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             self.get("/api/tts?v=en-US-Evil&t=x")
 
+    def post(self, path, obj, key="testkey"):
+        req = urllib.request.Request(self.base + path, data=json.dumps(obj).encode(), method="POST",
+                                     headers={"X-Key": key, "Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=10)
+
     def test_photo_flow(self):
         fakes.CALLS.clear()
-        img = "A" * 2000
-        body = json.dumps({"images": [img] * 5}).encode()
-        req = urllib.request.Request(self.base + "/api/photo", data=body, method="POST",
-                                     headers={"X-Key": "testkey", "Content-Type": "application/json"})
-        res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        images = ["A" * 2000] * 5
+        res = json.loads(self.post("/api/photo", {"images": images}).read())
         self.assertEqual([i["headline"] for i in res["items"]],
                          ["Madonā atklāj jaunu bibliotēku", "Ziemā ceļi tiks kaisīti biežāk", "Sludinājumi"])
         first = fakes.CALLS[0]["messages"][0]["content"]
@@ -96,20 +98,77 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(first[4]["cache_control"], {"type": "ephemeral"})
         self.assertEqual(fakes.CALLS[0]["model"], srv.CLAUDE_MODEL)
 
-        t0 = time.time()
-        lines = self.get(f"/api/photo/article?pid={res['pid']}&id=1").read().decode().splitlines()
-        msgs = [json.loads(l) for l in lines if l.strip()]
+        # stateless: the phone sends the photo again with the article request
+        r = self.post("/api/photo/article", {"images": images, "id": 1, "headline": res["items"][0]["headline"]})
+        msgs = [json.loads(l) for l in r.read().decode().splitlines() if l.strip()]
         self.assertEqual(msgs[-1], {"done": True})
         sentences = [m["s"] for m in msgs if "s" in m]
         self.assertEqual(sentences[0], "Madonas novadā šonedēļ atklāja jauno bibliotēku.")
-        self.assertIn("Madonā atklāj jaunu bibliotēku", fakes.CALLS[1]["messages"][0]["content"][-1]["text"])
-        # second time: served from the finished job, no new Claude call
-        n = len(fakes.CALLS)
-        again = self.get(f"/api/photo/article?pid={res['pid']}&id=1").read().decode()
-        self.assertEqual(len(fakes.CALLS), n)
-        self.assertIn('"done": true', again)
-        with self.assertRaises(urllib.error.HTTPError):
-            self.get("/api/photo/article?pid=nope&id=1")
+        second = fakes.CALLS[1]["messages"][0]["content"]
+        self.assertEqual(second[:5], first[:5])                      # identical prefix -> prompt cache hit
+        self.assertIn("Madonā atklāj jaunu bibliotēku", second[-1]["text"])
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.post("/api/photo/article", {"images": "nope", "id": 1})
+        self.assertEqual(e.exception.code, 400)
+
+
+class KeylessTests(unittest.TestCase):
+    """A fresh Vercel deployment without ACCESS_KEY: LSM works for anyone, paid features stay off."""
+
+    def setUp(self):
+        self.saved = srv.ACCESS_KEY
+        srv.ACCESS_KEY = ""
+
+    def tearDown(self):
+        srv.ACCESS_KEY = self.saved
+
+    def test_keyless(self):
+        cfg = json.loads(srv.handle("GET", "/api/config", {}, {}).body)
+        self.assertFalse(cfg["photo"] or cfg["azure"] or cfg["keyRequired"])
+        self.assertEqual(srv.handle("GET", "/api/headlines", {}, {}).status, 200)
+        self.assertEqual(srv.handle("POST", "/api/photo", {}, {}, b'{"images": []}').status, 503)
+        self.assertEqual(srv.handle("GET", "/api/tts", {"t": ["x"]}, {}).status, 503)
+
+
+class VercelAdapterTests(unittest.TestCase):
+    def run_app(self, method, path, query=b"", body=b"", headers=None):
+        import asyncio, vercel_app
+        sent = []
+        scope = {"type": "http", "method": method, "path": path, "query_string": query,
+                 "headers": [(k.encode(), v.encode()) for k, v in (headers or {"x-key": "testkey"}).items()]}
+        chunks = [body[i:i + 70000] for i in range(0, len(body), 70000)] or [b""]
+        msgs = [{"type": "http.request", "body": c, "more_body": i < len(chunks) - 1} for i, c in enumerate(chunks)]
+
+        async def receive():
+            return msgs.pop(0) if msgs else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+        asyncio.run(vercel_app.app(scope, receive, send))
+        return sent
+
+    def test_json_route(self):
+        sent = self.run_app("GET", "/api/config")
+        self.assertEqual(sent[0]["status"], 200)
+        self.assertTrue(json.loads(sent[1]["body"])["photo"])
+        self.assertEqual(self.run_app("GET", "/api/config", headers={"x-key": "bad"})[0]["status"], 401)
+
+    def test_streaming_route(self):
+        body = json.dumps({"images": ["A" * 2000] * 5, "id": 2, "headline": "Ziemā ceļi"}).encode()
+        sent = self.run_app("POST", "/api/photo/article", body=body)
+        self.assertEqual(sent[0]["status"], 200)
+        parts = [m for m in sent[1:] if m.get("body")]
+        self.assertGreater(len(parts), 3)                              # arrived in pieces, not one blob
+        lines = b"".join(m["body"] for m in parts).decode().splitlines()
+        self.assertEqual(json.loads(lines[-1]), {"done": True})
+        self.assertFalse(sent[-1]["more_body"])
+
+    def test_tts_range_and_cache_header(self):
+        sent = self.run_app("GET", "/api/tts", b"v=lv-LV-NilsNeural&t=Sveiki",
+                            headers={"x-key": "testkey", "range": "bytes=0-1"})
+        self.assertEqual(sent[0]["status"], 206)
+        hdrs = dict(sent[0]["headers"])
+        self.assertIn(b"s-maxage", hdrs[b"cache-control"])
 
 
 if __name__ == "__main__":

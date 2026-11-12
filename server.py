@@ -7,6 +7,8 @@ Ziņu lasītājs — reads news aloud for people who can no longer read a screen
   * Photo of a printed newspaper page -> headlines are recognised (Claude vision)
     and read the same way; tapping reads that article.
 
+Runs locally (this file) or on Vercel (api/*.py -> vercel_app.py -> handle() below).
+
 Run:   python server.py            (opens the app in your browser)
 Phone: open the "Wi-Fi" address it prints, on a phone in the same Wi-Fi.
 
@@ -40,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xml_escape
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-WEB_DIR = os.path.join(ROOT, "web")
+WEB_DIR = os.path.join(ROOT, "public")
 VERSION = "0.2.0"
 
 
@@ -66,9 +68,12 @@ def env(name, default=""):
     return os.environ.get(name, default).strip()
 
 
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+
+
 def _access_key():
     key = env("ACCESS_KEY")
-    if key:
+    if key or ON_VERCEL:          # on Vercel the key can only come from the project's environment variables
         return key
     path = os.path.join(ROOT, ".access_key")
     try:
@@ -103,6 +108,14 @@ MAX_HEADLINES = int(env("MAX_HEADLINES", "12"))
 WAIT_SECONDS = float(env("WAIT_SECONDS", "6"))
 LONG_PRESS_MS = int(env("LONG_PRESS_MS", "1000"))
 DEFAULT_RATE = float(env("DEFAULT_RATE", "0.9"))
+
+
+def photo_enabled():      # paid features only ever run behind an access key
+    return bool(ANTHROPIC_API_KEY and ACCESS_KEY)
+
+
+def azure_enabled():
+    return bool(AZURE_SPEECH_KEY and ACCESS_KEY)
 
 FEED_NEWS = "https://www.lsm.lv/rss/?lang=lv&catid=14"      # Visas ziņas
 FEED_WEATHER = "https://www.lsm.lv/rss/?lang=lv&catid=19"   # Laika ziņas
@@ -623,71 +636,40 @@ def iter_sse_text(resp):
             return
 
 
-class ArticleJob:
-    """Transcription of one article; keeps running even if the phone disconnects."""
-
-    def __init__(self):
-        self.sentences, self.done, self.error = [], False, None
-        self.cond = threading.Condition()
-
-    def add(self, s):
-        with self.cond:
-            self.sentences.append(s)
-            self.cond.notify_all()
-
-    def finish(self, error=None):
-        with self.cond:
-            self.done, self.error = True, error
-            self.cond.notify_all()
+def check_images(images):
+    """Photos come from the phone as base64 JPEGs: the whole page plus up to 4 crops."""
+    if not isinstance(images, list) or not 1 <= len(images) <= 6 or \
+            not all(isinstance(i, str) and 100 < len(i) < 9_000_000 for i in images):
+        raise ValueError("bad images")
+    for i in images:
+        base64.b64decode(i[:400] + "=" * (-len(i[:400]) % 4))   # cheap sanity check (raises on garbage)
+    return images
 
 
-PHOTOS = OrderedDict()
-PHOTOS_LOCK = threading.Lock()
+def article_lines(images, aid, headline):
+    """NDJSON lines for one article, sent as soon as each sentence is ready.
 
-
-def save_photo(images, items):
-    pid = secrets.token_urlsafe(9)
-    with PHOTOS_LOCK:
-        now = time.time()
-        for old in [k for k, v in PHOTOS.items() if now - v["t"] > 3 * 3600]:
-            del PHOTOS[old]
-        while len(PHOTOS) >= 20:
-            PHOTOS.popitem(last=False)
-        PHOTOS[pid] = {"images": images, "items": {i["id"]: i for i in items}, "jobs": {}, "t": now}
-    return pid
-
-
-def _run_article_job(photo, item, job):
+    Stateless on purpose: the phone sends the photos again with every article request,
+    so this also works on serverless hosting. Prompt caching keeps the repeat cheap."""
+    def line(obj):
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
     try:
         if not PHOTO_BUDGET.take():
             raise LimitReached("photo limit")
-        task = ARTICLE_TASK.format(id=item["id"], headline=item["headline"].replace('"', "'"))
+        task = ARTICLE_TASK.format(id=aid, headline=str(headline).replace('"', "'")[:300])
         payload = {"model": CLAUDE_MODEL, "max_tokens": 8000, "stream": True, "system": PHOTO_SYSTEM,
-                   "messages": [{"role": "user", "content": _photo_content(photo["images"], task)}]}
+                   "messages": [{"role": "user", "content": _photo_content(images, task)}]}
         splitter = StreamSplitter()
         with claude_request(payload) as resp:
             for piece in iter_sse_text(resp):
                 for s in splitter.feed(piece):
-                    job.add(s)
+                    yield line({"s": s})
         for s in splitter.flush():
-            job.add(s)
-        job.finish()
+            yield line({"s": s})
+        yield line({"done": True})
     except Exception as e:
         log(f"KĻŪDA raksta atšifrēšanā: {e}")
-        job.finish(error="limit" if isinstance(e, LimitReached) else "failed")
-
-
-def article_job(pid, aid):
-    with PHOTOS_LOCK:
-        photo = PHOTOS.get(pid)
-        if not photo or aid not in photo["items"]:
-            return None
-        job = photo["jobs"].get(aid)
-        if job is not None and job.error is None:
-            return job
-        job = photo["jobs"][aid] = ArticleJob()
-    threading.Thread(target=_run_article_job, args=(photo, photo["items"][aid], job), daemon=True).start()
-    return job
+        yield line({"error": "limit" if isinstance(e, LimitReached) else "failed"})
 
 
 # ------------------------------------------------------------ Azure voice --
@@ -746,10 +728,108 @@ def tts_audio(text, voice, rate):
         waiter.set()
 
 
-# ------------------------------------------------------------------ server --
+# ------------------------------------------------------------ requests --
+# One request handler shared by the local server (below) and the Vercel functions (vercel_app.py).
+class Reply:
+    def __init__(self, status=200, body=b"", ctype="application/json; charset=utf-8", headers=None, stream=None):
+        self.status, self.ctype, self.headers, self.stream = status, ctype, dict(headers or {}), stream
+        self.body = body.encode("utf-8") if isinstance(body, str) else body
+
+
+def json_reply(obj, status=200):
+    return Reply(status, json.dumps(obj, ensure_ascii=False), headers={"Cache-Control": "no-store"})
+
+
+def media_reply(data, ctype, range_header, cache):
+    """Byte-range aware, because iPhones refuse to play audio without it."""
+    extra = {"Accept-Ranges": "bytes", "Cache-Control": cache}
+    m = re.match(r"bytes=(\d*)-(\d*)$", (range_header or "").strip())
+    if m and (m.group(1) or m.group(2)):
+        size = len(data)
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
+        else:
+            start, end = max(0, size - int(m.group(2))), size - 1
+        if start >= size or start > end:
+            return Reply(416, b"", ctype, {"Content-Range": f"bytes */{size}"})
+        extra["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return Reply(206, data[start:end + 1], ctype, extra)
+    return Reply(200, data, ctype, extra)
+
+
+def authorized(headers, query):
+    if not ACCESS_KEY:                       # no key configured: free LSM reading only (paid features are off)
+        return True
+    given = headers.get("x-key") or (query.get("k") or [""])[0]
+    return secrets.compare_digest(given.encode(), ACCESS_KEY.encode())
+
+
+def handle(method, path, query, headers, body=b""):
+    """Route one /api request. `headers` has lower-case names. Returns a Reply."""
+    try:
+        if not authorized(headers, query):
+            return json_reply({"error": "key"}, 401)
+        q1 = lambda name, default="": (query.get(name) or [default])[0]
+
+        if method in ("GET", "HEAD"):
+            if path == "/api/config":
+                return json_reply({
+                    "version": VERSION, "photo": photo_enabled(), "azure": azure_enabled(),
+                    "azureVoices": AZURE_VOICES if azure_enabled() else [], "keyRequired": bool(ACCESS_KEY),
+                    "waitSeconds": WAIT_SECONDS, "longPressMs": LONG_PRESS_MS, "rate": DEFAULT_RATE})
+            if path == "/api/headlines":
+                return json_reply(get_headlines())
+            if path == "/api/article":
+                url = q1("u")
+                if not url.startswith("https://www.lsm.lv/"):
+                    return json_reply({"error": "only www.lsm.lv links"}, 400)
+                return json_reply(extract_article(fetch(url)))
+            if path == "/api/tts":
+                if not azure_enabled():
+                    return json_reply({"error": "azure disabled"}, 503)
+                text, voice = q1("t").strip()[:600], q1("v", AZURE_VOICES[0])
+                try:
+                    rate = min(1.5, max(0.5, float(q1("r", "1"))))
+                except ValueError:
+                    rate = 1.0
+                if not text or voice not in AZURE_VOICES:
+                    return json_reply({"error": "bad request"}, 400)
+                # The same sentence is the same file: let browsers and the CDN keep it.
+                return media_reply(tts_audio(text, voice, rate), "audio/mpeg", headers.get("range"),
+                                   "public, max-age=86400, s-maxage=2592000")
+
+        if method == "POST" and path in ("/api/photo", "/api/photo/article"):
+            if not photo_enabled():
+                return json_reply({"error": "photo disabled"}, 503)
+            data = json.loads(body.decode("utf-8") or "{}")
+            images = check_images(data.get("images"))
+            if path == "/api/photo":
+                items = recognise_headlines(images)
+                log(f"Foto: atrasti {len(items)} virsraksti")
+                return json_reply({"items": items})
+            try:
+                aid = int(data.get("id"))
+            except (TypeError, ValueError):
+                return json_reply({"error": "bad id"}, 400)
+            return Reply(200, ctype="application/x-ndjson; charset=utf-8",
+                         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+                         stream=article_lines(images, aid, data.get("headline", "")))
+        return json_reply({"error": "not found"}, 404)
+    except LimitReached:
+        return json_reply({"error": "limit"}, 429)
+    except ValueError as e:
+        return json_reply({"error": str(e)}, 400)
+    except Exception as e:
+        log(f"KĻŪDA: {e}")
+        return json_reply({"error": str(e)}, 500)
+
+
+# ------------------------------------------------------------ local server --
 _MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".webmanifest": "application/manifest+json",
          ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json"}
+MAX_BODY = 40 * 1024 * 1024
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -758,177 +838,50 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    # -- helpers
-    def _send(self, code, body, ctype, extra=None):
-        data = body.encode("utf-8") if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        for k, v in (extra or {}).items():
+    def _write(self, r):
+        self.send_response(r.status)
+        self.send_header("Content-Type", r.ctype)
+        for k, v in r.headers.items():
             self.send_header(k, v)
+        if r.stream is None:
+            self.send_header("Content-Length", str(len(r.body)))
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(data)
-
-    def _json(self, obj, code=200):
-        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8",
-                   {"Cache-Control": "no-store"})
-
-    def _send_media(self, data, ctype):
-        """Byte-range aware, because iPhones refuse to play audio without it."""
-        rng = self.headers.get("Range", "")
-        m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip())
-        extra = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=86400"}
-        if m and (m.group(1) or m.group(2)):
-            size = len(data)
-            if m.group(1):
-                start = int(m.group(1))
-                end = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
-            else:
-                start, end = max(0, size - int(m.group(2))), size - 1
-            if start >= size or start > end:
-                self._send(416, b"", ctype, {"Content-Range": f"bytes */{size}"})
-                return
-            extra["Content-Range"] = f"bytes {start}-{end}/{size}"
-            self._send(206, data[start:end + 1], ctype, extra)
-        else:
-            self._send(200, data, ctype, extra)
-
-    def _authorized(self, q):
-        given = self.headers.get("X-Key") or (q.get("k") or [""])[0]
-        return secrets.compare_digest(given.encode(), ACCESS_KEY.encode())
+        if self.command == "HEAD":
+            return
+        if r.stream is None:
+            self.wfile.write(r.body)
+            return
+        for chunk in r.stream:              # HTTP/1.0: the connection closes when the stream ends
+            self.wfile.write(chunk)
+            self.wfile.flush()
 
     def _static(self, path):
-        rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        rel = "index.html" if path in ("", "/") else urllib.parse.unquote(path).lstrip("/")
         full = os.path.normpath(os.path.join(WEB_DIR, rel))
         if not full.startswith(WEB_DIR + os.sep) or not os.path.isfile(full):
-            self._send(404, "not found", "text/plain; charset=utf-8")
-            return
+            return Reply(404, "not found", "text/plain; charset=utf-8")
         with open(full, "rb") as f:
             data = f.read()
-        ctype = _MIME.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
-        self._send(200, data, ctype, {"Cache-Control": "no-cache"})
+        return Reply(200, data, _MIME.get(os.path.splitext(full)[1].lower(), "application/octet-stream"),
+                     {"Cache-Control": "no-cache"})
 
-    # -- routes
-    def do_HEAD(self):
-        self.do_GET()
-
-    def do_GET(self):
+    def _dispatch(self):
         u = urllib.parse.urlparse(self.path)
-        q = urllib.parse.parse_qs(u.query)
         try:
             if not u.path.startswith("/api/"):
-                return self._static(u.path)
-            if not self._authorized(q):
-                return self._json({"error": "key"}, 401)
-            if u.path == "/api/config":
-                return self._json({
-                    "version": VERSION, "photo": bool(ANTHROPIC_API_KEY), "azure": bool(AZURE_SPEECH_KEY),
-                    "azureVoices": AZURE_VOICES if AZURE_SPEECH_KEY else [],
-                    "waitSeconds": WAIT_SECONDS, "longPressMs": LONG_PRESS_MS, "rate": DEFAULT_RATE})
-            if u.path == "/api/headlines":
-                return self._json(get_headlines())
-            if u.path == "/api/article":
-                url = (q.get("u") or [""])[0]
-                if not url.startswith("https://www.lsm.lv/"):
-                    return self._json({"error": "only www.lsm.lv links"}, 400)
-                return self._json(extract_article(fetch(url)))
-            if u.path == "/api/tts":
-                return self._tts(q)
-            if u.path == "/api/photo/article":
-                return self._photo_article(q)
-            self._json({"error": "not found"}, 404)
+                return self._write(self._static(u.path))
+            body = b""
+            if self.command == "POST":
+                length = int(self.headers.get("Content-Length") or 0)
+                if length < 0 or length > MAX_BODY:
+                    return self._write(json_reply({"error": "bad size"}, 413))
+                body = self.rfile.read(length)
+            headers = {k.lower(): v for k, v in self.headers.items()}
+            self._write(handle(self.command, u.path, urllib.parse.parse_qs(u.query), headers, body))
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception as e:
-            log(f"KĻŪDA: {e}")
-            try:
-                self._json({"error": str(e)}, 500)
-            except Exception:
-                pass
 
-    def do_POST(self):
-        u = urllib.parse.urlparse(self.path)
-        q = urllib.parse.parse_qs(u.query)
-        try:
-            if not self._authorized(q):
-                return self._json({"error": "key"}, 401)
-            if u.path != "/api/photo":
-                return self._json({"error": "not found"}, 404)
-            if not ANTHROPIC_API_KEY:
-                return self._json({"error": "photo disabled"}, 503)
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > 40 * 1024 * 1024:
-                return self._json({"error": "bad size"}, 413)
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
-            images = body.get("images")
-            if not isinstance(images, list) or not 1 <= len(images) <= 6 or \
-                    not all(isinstance(i, str) and 100 < len(i) < 9_000_000 for i in images):
-                return self._json({"error": "bad images"}, 400)
-            for i in images:
-                base64.b64decode(i[:400] + "=" * (-len(i[:400]) % 4))   # cheap sanity check
-            items = recognise_headlines(images)
-            pid = save_photo(images, items)
-            log(f"Foto: atrasti {len(items)} virsraksti")
-            self._json({"pid": pid, "items": items})
-        except LimitReached:
-            self._json({"error": "limit"}, 429)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as e:
-            log(f"KĻŪDA foto apstrādē: {e}")
-            try:
-                self._json({"error": str(e)}, 500)
-            except Exception:
-                pass
-
-    def _tts(self, q):
-        if not AZURE_SPEECH_KEY:
-            return self._json({"error": "azure disabled"}, 503)
-        text = (q.get("t") or [""])[0].strip()[:600]
-        voice = (q.get("v") or [AZURE_VOICES[0]])[0]
-        try:
-            rate = min(1.5, max(0.5, float((q.get("r") or ["1"])[0])))
-        except ValueError:
-            rate = 1.0
-        if not text or voice not in AZURE_VOICES:
-            return self._json({"error": "bad request"}, 400)
-        try:
-            self._send_media(tts_audio(text, voice, rate), "audio/mpeg")
-        except LimitReached:
-            self._json({"error": "limit"}, 429)
-
-    def _photo_article(self, q):
-        pid = (q.get("pid") or [""])[0]
-        try:
-            aid = int((q.get("id") or ["0"])[0])
-        except ValueError:
-            aid = 0
-        job = article_job(pid, aid)
-        if job is None:
-            return self._json({"error": "photo gone"}, 404)
-        # Stream one JSON object per line as sentences become ready (connection closes at the end).
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        sent = 0
-        while True:
-            with job.cond:
-                if sent >= len(job.sentences) and not job.done:
-                    job.cond.wait(timeout=15)
-                new, done, error = job.sentences[sent:], job.done, job.error
-            if new:
-                self.wfile.write("".join(json.dumps({"s": s}, ensure_ascii=False) + "\n" for s in new).encode("utf-8"))
-                sent += len(new)
-            elif not done:
-                self.wfile.write(b"\n")          # keep-alive through proxies
-            self.wfile.flush()
-            if done and sent >= len(job.sentences):
-                self.wfile.write((json.dumps({"error": error} if error else {"done": True}) + "\n").encode())
-                self.wfile.flush()
-                return
+    do_GET = do_HEAD = do_POST = _dispatch
 
 
 # -------------------------------------------------------------------- main --
@@ -983,8 +936,8 @@ def main():
     ip = lan_ip()
     if ip and HOST in ("0.0.0.0", "", "::"):
         log(f"Telefonā (tajā pašā Wi-Fi):  http://{ip}:{port}/?k={ACCESS_KEY}")
-    log("Avīzes foto: " + (f"ieslēgts ({CLAUDE_MODEL})" if ANTHROPIC_API_KEY else "izslēgts (nav ANTHROPIC_API_KEY)"))
-    log("Azure balsis: " + (", ".join(AZURE_VOICES) if AZURE_SPEECH_KEY else "izslēgtas (nav AZURE_SPEECH_KEY)"))
+    log("Avīzes foto: " + (f"ieslēgts ({CLAUDE_MODEL})" if photo_enabled() else "izslēgts (nav ANTHROPIC_API_KEY)"))
+    log("Azure balsis: " + (", ".join(AZURE_VOICES) if azure_enabled() else "izslēgtas (nav AZURE_SPEECH_KEY)"))
     log("Lai apturētu, aizveriet šo logu (vai Ctrl+C).")
     if "--no-browser" not in sys.argv and not env("NO_BROWSER"):
         threading.Timer(0.8, open_browser, args=(local,)).start()

@@ -25,7 +25,27 @@ strip at the bottom is for the helper: voice, speed, replay the explanation.
 Helper keys on a laptop: `A` newspaper photo, `1`–`9` voice, `+`/`−` speed, `T` read the short teaser after
 each LSM headline, `I` explanation again, `V` *Ziņas vieglajā valodā* (human-read recording), `R` reload, `Esc` stop.
 
-## Run it
+## Put it online with Vercel (easiest for her)
+
+Nothing to install or start: her phone just opens a link.
+
+1. Sign in at [vercel.com](https://vercel.com) with GitHub → **Add New… → Project** → import
+   `lsm-zinu-lasitajs` → **Deploy**. No settings are needed.
+2. Vercel gives an address like `https://lsm-zinu-lasitajs.vercel.app`. Open it on her phone and use
+   *Add to Home screen*. LSM news works straight away, free.
+3. For the newspaper photo (and optional Azure voices) add these under **Project → Settings → Environment
+   Variables**, then **Deployments → ⋯ → Redeploy**:
+   * `ACCESS_KEY` – any long word you choose (paid features stay off without it)
+   * `ANTHROPIC_API_KEY` – from [platform.claude.com](https://platform.claude.com)
+   * optional `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION`, `CLAUDE_MODEL`
+
+   Her link then becomes `https://….vercel.app/?k=YOUR_ACCESS_KEY` (open that once before *Add to Home screen*).
+4. Every push to GitHub redeploys automatically.
+
+On Vercel the daily limits are counted per server instance, so also set a monthly spend limit in the
+Anthropic Console as the real cap. The functions run in Frankfurt (`fra1`), close to LSM and Latvia.
+
+## Run it on your own computer
 
 Needs Python 3.8 or newer ([python.org](https://www.python.org/downloads/); on Windows tick *Add Python to PATH*).
 No other packages are needed.
@@ -47,7 +67,7 @@ Telefonā (tajā pašā Wi-Fi):  http://192.168.1.23:8765/?k=…
 *Add to Home screen* so it opens like an app. Windows may ask to allow Python through the firewall: allow it
 for private networks. The `?k=…` part is the access key; keep it in the link.
 
-## Run everything on an Android phone (no computer)
+## Run everything on an Android phone without hosting (Termux)
 
 1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or its GitHub releases
    (not Google Play: that build is outdated).
@@ -91,13 +111,13 @@ Copy `.env.example` to `.env` next to `server.py`. All keys are optional.
 ## How the newspaper photo works
 
 1. The phone shrinks the photo and sends it as the whole page plus four overlapping quarters, so small print
-   stays readable.
+   stays readable (kept under 3.8 MB, below Vercel's 4.5 MB request limit).
 2. Claude lists the headlines in reading order (adverts, captions and the masthead are skipped).
-3. When an article is chosen, Claude transcribes it and the text is **streamed**: reading starts after a few
-   seconds while the rest is still arriving. The page images are sent with prompt caching, so each article
-   after the first costs little.
+3. When an article is chosen, the phone sends the photo again with the headline, Claude transcribes it and the
+   text is **streamed**: reading starts after a few seconds while the rest is still arriving. The identical
+   images hit Claude's prompt cache, so each article after the first costs little.
 
-Photos stay in the server's memory for up to 3 hours and are not written to disk. They are sent to the
+The server stores nothing: photos are only held on the phone during the session and are sent to the
 Anthropic API for recognition.
 
 ## Costs (estimates)
@@ -129,7 +149,7 @@ Put HTTPS in front of it (for example Caddy or a Cloudflare Tunnel): phones keep
 ## Tests
 
 ```
-python -m unittest discover -s tests          # offline: feeds, article extraction, photo + voice endpoints
+python -m unittest discover -s tests          # offline: feeds, extraction, photo + voice endpoints, Vercel adapter
 python tests/e2e_phone.py                     # emulated phone run (needs: pip install playwright)
 ```
 

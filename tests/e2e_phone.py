@@ -25,11 +25,12 @@ httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
 threading.Thread(target=httpd.serve_forever, daemon=True).start()
 URL = f"http://127.0.0.1:{httpd.server_address[1]}/?k=testkey"
 
-PAGE_JPG = os.path.join(OUT, "_page.jpg")
+PAGE_JPG = os.environ.get("E2E_PAGE") or os.path.join(OUT, "_page.jpg")
 from PIL import Image, ImageDraw
 im = Image.new("RGB", (3000, 4000), "white")
 ImageDraw.Draw(im).rectangle([200, 200, 2800, 600], fill="black")
-im.save(PAGE_JPG, quality=80)
+if not os.environ.get("E2E_PAGE"):
+    im.save(PAGE_JPG, quality=80)
 
 def mock(with_lv_voice):
     voices = ["{name:'Google US English', lang:'en-US'}"]
@@ -113,7 +114,10 @@ with sync_playwright() as p:
     wait_for(page, "S.session==='photo' && S.mode==='wait' && S.idx===0")
     page.screenshot(path=f"{OUT}/06_photo_headline.png")
     imgs = [b for b in fakes.CALLS[0]["messages"][0]["content"] if b["type"] == "image"]
-    print("photo sent as", len(imgs), "images; headlines:", page.evaluate("S.items.map(i=>i.title)"))
+    total = sum(len(b["source"]["data"]) for b in imgs)
+    print("photo sent as", len(imgs), "images,", round(total / 1e6, 2), "MB base64 (limit 3.8); headlines:",
+          page.evaluate("S.items.map(i=>i.title)"))
+    assert total <= 3_800_000
     page.tap("#stage")
     wait_for(page, "S.mode==='article' || S.mode==='waitText'")
     wait_for(page, "S.mode==='article' && S.pos>=1"); page.screenshot(path=f"{OUT}/07_photo_article.png")
@@ -121,6 +125,8 @@ with sync_playwright() as p:
     sp = spoken(page)
     print("photo article read:", [s for s in sp if "bibliotēk" in s.lower()][:3])
     print("found-words line:", [s for s in sp if s.startswith("Atradu")])
+    art_call = fakes.CALLS[1]["messages"][0]["content"]
+    print("article request resent the same photo:", art_call[:5] == fakes.CALLS[0]["messages"][0]["content"][:5])
     wait_for(page, "S.view==='home'", timeout=30)
     print("photo session ended ->", spoken(page)[-2:])
 

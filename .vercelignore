@@ -1,0 +1,7 @@
+tests/
+docs/
+Dockerfile
+start-windows.bat
+start-android.sh
+.env
+.access_key

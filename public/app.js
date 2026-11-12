@@ -345,7 +345,7 @@ async function loadConfig() {
   try {
     const r = await api('/api/config');
     if (r.status === 401) {
-      warn('key', 'Trūkst piekļuves atslēgas. Atveriet pilno saiti, ko rāda serveris (tā beidzas ar ?k=…).');
+      warn('key', 'Trūkst piekļuves atslēgas. Atveriet pilno saiti ar atslēgu (tā beidzas ar ?k=…).');
     } else {
       Object.assign(CFG, await r.json());
       hideWarn('server');
@@ -393,7 +393,8 @@ function lsmSource(it) {
   return src;
 }
 
-function streamSource(url) {        // newspaper article: sentences arrive while Claude is still reading the photo
+// Newspaper article: sentences arrive while Claude is still reading the photo.
+function streamSource(url, opts, onDone) {
   const src = newSource();
   const take = line => {
     line = line.trim();
@@ -406,7 +407,7 @@ function streamSource(url) {        // newspaper article: sentences arrive while
   };
   (async () => {
     try {
-      const r = await api(url);
+      const r = await api(url, opts);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       if (r.body && r.body.getReader) {
         const reader = r.body.getReader(), dec = new TextDecoder();
@@ -427,9 +428,22 @@ function streamSource(url) {        // newspaper article: sentences arrive while
       src.failed = true;
     }
     src.done = true;
+    if (onDone) onDone(src);
     wake(src);
   })();
   return src;
+}
+
+// The server keeps nothing between requests (so it can run on Vercel): the photo is sent again for each
+// article, and finished articles are kept here so reopening one is instant.
+const photo = { images: null, done: {} };
+function photoSource(it) {
+  const cached = photo.done[it.id];
+  if (cached) return Object.assign(newSource(), { sentences: cached.slice(), done: true });
+  return streamSource('/api/photo/article', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ images: photo.images, id: it.id, headline: it.title }),
+  }, src => { if (!src.failed && src.sentences.length) photo.done[it.id] = src.sentences.slice(); });
 }
 
 // ---------------------------------------------------------------- flows --
@@ -521,9 +535,7 @@ async function openItem() {
   if (it.type === 'easy') return playEasy(it);
   setMode('busy');
   show('Lasu rakstu', it.title, 'Lūdzu, uzgaidiet');
-  S.art = it.type === 'photo'
-    ? streamSource(`/api/photo/article?pid=${encodeURIComponent(it.pid)}&id=${it.id}`)
-    : lsmSource(it);
+  S.art = it.type === 'photo' ? photoSource(it) : lsmSource(it);
   S.pos = 0;
   if (!await say(it.type === 'photo' ? 'Lasu rakstu. Lūdzu, uzgaidiet.' : 'Lasu rakstu.')) return;
   readArticle();
@@ -664,7 +676,9 @@ async function readPhoto(file) {
     return failHome('Šajā foto neizdevās atrast virsrakstus. Mēģiniet vēlreiz: novietojiet avīzi labā gaismā ' +
       'un turiet telefonu tieši virs lapas, lai visa lapa ir redzama.');
   }
-  S.items = res.items.map(x => ({ type: 'photo', title: x.headline, say_title: x.say_headline || x.headline, pid: res.pid, id: x.id }));
+  photo.images = res.images;
+  photo.done = {};
+  S.items = res.items.map(x => ({ type: 'photo', title: x.headline, say_title: x.say_headline || x.headline, id: x.id }));
   S.idx = 0;
   if (!await say(foundWords(S.items.length))) return;
   runHeadlines();
@@ -676,7 +690,9 @@ async function sendPhoto(file) {
     const r = await api('/api/photo', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ images }),
     });
-    return await r.json();
+    const res = await r.json();
+    res.images = images;
+    return res;
   } catch (e) {
     console.error(e);
     return { error: String(e) };
@@ -684,6 +700,8 @@ async function sendPhoto(file) {
 }
 
 // Whole page (for layout) + four overlapping quarters (so small print stays readable).
+// Kept under ~3.8 MB in total, because hosted servers (Vercel) refuse requests over 4.5 MB.
+const PHOTO_BUDGET = 3_800_000;
 async function prepareImages(file) {
   let src;
   try {
@@ -697,17 +715,23 @@ async function prepareImages(file) {
     });
   }
   const W = src.width, H = src.height;
-  const out = [toJpeg(src, 0, 0, W, H, 2400)];
-  if (Math.max(W, H) > 2600) {
-    const ox = W * 0.06, oy = H * 0.06, hw = W / 2, hh = H / 2;
-    for (const [cx, cy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-      const sx = Math.max(0, cx * hw - ox), sy = Math.max(0, cy * hh - oy);
-      out.push(toJpeg(src, sx, sy, Math.min(W - sx, hw + 2 * ox), Math.min(H - sy, hh + 2 * oy), 2400));
+  const tiles = Math.max(W, H) > 2600;
+  let size = 2000, quality = 0.82, out = [];
+  for (let attempt = 0; attempt < 6; attempt++) {
+    out = [toJpeg(src, 0, 0, W, H, size, quality)];
+    if (tiles) {
+      const ox = W * 0.06, oy = H * 0.06, hw = W / 2, hh = H / 2;
+      for (const [cx, cy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+        const sx = Math.max(0, cx * hw - ox), sy = Math.max(0, cy * hh - oy);
+        out.push(toJpeg(src, sx, sy, Math.min(W - sx, hw + 2 * ox), Math.min(H - sy, hh + 2 * oy), size, quality));
+      }
     }
+    if (out.reduce((n, b) => n + b.length, 0) <= PHOTO_BUDGET) break;
+    if (quality > 0.62) quality -= 0.1; else size = Math.round(size * 0.85);
   }
   return out;
 }
-function toJpeg(src, sx, sy, sw, sh, maxLong) {
+function toJpeg(src, sx, sy, sw, sh, maxLong, quality) {
   const k = Math.min(1, maxLong / Math.max(sw, sh));
   const c = document.createElement('canvas');
   c.width = Math.round(sw * k);
@@ -715,7 +739,7 @@ function toJpeg(src, sx, sy, sw, sh, maxLong) {
   const g = c.getContext('2d');
   g.imageSmoothingQuality = 'high';
   g.drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
-  return c.toDataURL('image/jpeg', 0.85).split(',')[1];
+  return c.toDataURL('image/jpeg', quality).split(',')[1];
 }
 
 // ------------------------------------------------------ the one button --

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "public",
+  "regions": [
+    "fra1"
+  ],
+  "functions": {
+    "api/**/*.py": {
+      "maxDuration": 120,
+      "excludeFiles": "{tests/**,docs/**,public/**,Dockerfile,start-*,*.md}"
+    }
+  },
+  "headers": [
+    {
+      "source": "/((?!api/).*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache"
+        }
+      ]
+    }
+  ]
+}
